@@ -1,10 +1,16 @@
 # Manual QRadar Log Forwarding Setup
 
-This document provides instructions for manually configuring Linux systems to forward audit logs to IBM QRadar SIEM. These instructions are an alternative to using the provided installer scripts.
+This document provides instructions for manually configuring Linux systems to forward audit logs to IBM QRadar SIEM. These instructions are an alternative to using the provided installer scripts and have been verified against official documentation for rsyslog, auditd, and SELinux.
+
+## Important Version Notes
+
+- **Rsyslog Version**: Some parameters like `forceSingleInstance` require rsyslog v8.38.0 or later
+- **RHEL 8+ Changes**: audispd functionality is integrated into auditd with path changes
+- **Rocky Linux**: Minimal installations do NOT include rsyslog by default - manual installation required
 
 ## Introduction
 
-The goal of this setup is to configure `auditd` to collect system audit events, `rsyslog` to forward these events to QRadar, and a Python script to parse and format the logs for better readability and analysis in QRadar.
+The goal of this setup is to configure `auditd` to collect system audit events, `rsyslog` to forward these events to QRadar using **TCP (recommended over UDP)**, and a Python script to parse and format the logs for better readability and analysis in QRadar.
 
 This guide is divided into two main sections:
 *   **Debian/Ubuntu Setup**
@@ -17,6 +23,7 @@ Please follow the instructions for your specific distribution.
 *   **Root Access**: You must have `sudo` or `root` privileges to complete these steps.
 *   **QRadar Server**: You must have a QRadar server with a configured log source to receive the forwarded logs.
 *   **Network Connectivity**: The system you are configuring must be able to reach the QRadar server on the specified IP address and port.
+*   **Rsyslog Version Check**: Run `rsyslogd -v` to check your version (some features require v8.38.0+)
 
 ---
 
@@ -156,6 +163,10 @@ Copy and paste the following code into the file:
 ```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+QRadar EXECVE Log Parser for rsyslog omprog module
+IMPORTANT: Uses readline() to avoid buffering issues with rsyslog
+"""
 import sys
 import re
 import signal
@@ -165,6 +176,13 @@ class ExecveParser:
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        
+        # Compile regex patterns for better performance
+        self.args_pattern = re.compile(r'a(\d+)="([^"]*)"')
+        self.cleanup_patterns = [
+            re.compile(r'a\d+="[^"]*"\s*'),
+            re.compile(r'argc=\d+\s*')
+        ]
 
     def _signal_handler(self, signum, frame):
         sys.exit(0)
@@ -177,19 +195,20 @@ class ExecveParser:
             return None
 
         try:
-            args_pattern = r'a(\d+)="([^"]*)"'
-            args_matches = re.findall(args_pattern, line)
-
+            args_matches = self.args_pattern.findall(line)
+            
             if not args_matches:
                 return line
 
             args_dict = {int(index): value for index, value in args_matches}
-
             sorted_args = sorted(args_dict.items())
             combined_command = " ".join(arg[1] for arg in sorted_args)
 
-            cleaned_line = re.sub(r'a\d+="[^"]*"\s*', '', line).strip()
-            cleaned_line = re.sub(r'argc=\d+\s*', '', cleaned_line).strip()
+            # Clean up the original line
+            cleaned_line = line
+            for pattern in self.cleanup_patterns:
+                cleaned_line = pattern.sub('', cleaned_line)
+            cleaned_line = cleaned_line.strip()
 
             processed_line = f"{cleaned_line} cmd=\"{combined_command}\""
             return processed_line
@@ -198,13 +217,23 @@ class ExecveParser:
             return line
 
     def run(self):
+        """
+        Main processing loop using readline() to avoid buffering issues
+        CRITICAL: Do NOT use 'for line in sys.stdin' with rsyslog omprog
+        """
         try:
-            for line in sys.stdin:
+            while True:
+                line = sys.stdin.readline()
+                if not line:  # EOF
+                    break
+                    
                 line = line.strip()
                 if line:
                     processed_line = self.process_execve_line(line)
                     if processed_line is not None:
-                        print(processed_line, flush=True)
+                        print(processed_line)
+                        sys.stdout.flush()  # Critical for omprog communication
+                        
         except (KeyboardInterrupt, BrokenPipeError):
             pass
         except Exception:
@@ -233,6 +262,7 @@ Copy and paste the following configuration into the file, replacing `<QRADAR_IP>
 
 ```
 # QRadar Log Forwarding Configuration
+# Load required modules
 module(load="omprog")
 
 # QRadar-compatible template (RFC 3339 time stamp)
@@ -242,26 +272,28 @@ template(name="QRadarFormat" type="string"
 # Only process messages from facility local3
 if $syslogfacility-text == 'local3' then {
 
-    # Process EXECVE events with parser to prevent duplicates
+    # Process EXECVE events with parser
     if $msg contains 'type=EXECVE' then {
         action(
             type="omprog"
             binary="/usr/local/bin/qradar_execve_parser.py"
             template="RSYSLOG_TraditionalFileFormat"
-            forceSingleInstance="on"
+            # Note: forceSingleInstance requires rsyslog v8.38.0+
+            # Uncomment if your version supports it:
+            # forceSingleInstance="on"
             queue.workerThreads="1"
         )
     }
     
-    # Forward all audit logs to QRadar
+    # Forward all audit logs to QRadar using TCP (recommended)
     action(
         type="omfwd"
         target="<QRADAR_IP>"
         port="<QRADAR_PORT>"
-        protocol="tcp"
+        protocol="tcp"  # Use TCP for reliable delivery
         template="QRadarFormat"
         
-        # Reliable async queue with reasonable limits
+        # Reliable async queue with production-ready settings
         queue.type="linkedlist"
         queue.size="50000"
         queue.maxdiskspace="2g"
@@ -270,7 +302,7 @@ if $syslogfacility-text == 'local3' then {
         queue.lowWatermark="10000"
         queue.discardMark="45000"
         queue.discardSeverity="4"
-        action.resumeRetryCount="100"
+        action.resumeRetryCount="-1"  # Infinite retries for reliability
         action.resumeInterval="30"
     )
 
@@ -292,6 +324,9 @@ sudo systemctl restart rsyslog
 Verify the configuration and test log forwarding:
 
 ```bash
+# Check rsyslog version
+rsyslogd -v
+
 # Check rsyslog configuration syntax
 sudo rsyslogd -N1
 
@@ -302,7 +337,7 @@ echo 'type=EXECVE msg=audit(123:456): argc=3 a0="ls" a1="-la" a2="/tmp"' | sudo 
 logger -p local3.info "Test QRadar forwarding"
 logger -p local3.info 'type=EXECVE msg=audit(1234:567): argc=3 a0="test" a1="-la" a2="/tmp"'
 
-# Monitor traffic to QRadar
+# Monitor traffic to QRadar (should show TCP connection)
 sudo tcpdump -i any host <QRADAR_IP> and port <QRADAR_PORT> -A -n
 ```
 
@@ -310,7 +345,7 @@ sudo tcpdump -i any host <QRADAR_IP> and port <QRADAR_PORT> -A -n
 
 ## RHEL/CentOS/Rocky/AlmaLinux Manual Setup
 
-These instructions apply to RHEL 7+, CentOS 7+, and other RHEL-based distributions.
+These instructions apply to RHEL 7+, CentOS 7+, Rocky Linux, AlmaLinux, and other RHEL-based distributions.
 
 ### 1. Install Prerequisites
 
@@ -320,8 +355,12 @@ First, install the necessary packages using `yum` or `dnf`:
 # For RHEL 7/CentOS 7
 sudo yum install -y audit audispd-plugins rsyslog python3
 
-# For RHEL 8+ and derivatives
+# For RHEL 8+ and derivatives (Rocky Linux, AlmaLinux)
 sudo dnf install -y audit rsyslog python3
+
+# Note: Rocky Linux minimal installation requires rsyslog installation
+# Verify rsyslog is installed:
+rpm -q rsyslog || sudo dnf install -y rsyslog
 ```
 
 ### 2. Configure Auditd Rules
@@ -413,9 +452,14 @@ Copy and paste the following rules into the file:
 
 ### 3. Configure Audispd to Forward to Syslog
 
-Edit the `syslog.conf` file to enable forwarding of audit events to syslog:
+**Important**: The path differs based on RHEL version:
 
 ```bash
+# For RHEL 7/CentOS 7
+sudo nano /etc/audisp/plugins.d/syslog.conf
+
+# For RHEL 8+ (including Rocky Linux, AlmaLinux)
+# Note: audispd is integrated into auditd in RHEL 8+
 sudo nano /etc/audit/plugins.d/syslog.conf
 ```
 
@@ -443,6 +487,10 @@ Copy and paste the following code into the file:
 ```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+QRadar EXECVE Log Parser for rsyslog omprog module
+IMPORTANT: Uses readline() to avoid buffering issues with rsyslog
+"""
 import sys
 import re
 import signal
@@ -452,6 +500,13 @@ class ExecveParser:
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        
+        # Compile regex patterns for better performance
+        self.args_pattern = re.compile(r'a(\d+)="([^"]*)"')
+        self.cleanup_patterns = [
+            re.compile(r'a\d+="[^"]*"\s*'),
+            re.compile(r'argc=\d+\s*')
+        ]
 
     def _signal_handler(self, signum, frame):
         sys.exit(0)
@@ -464,19 +519,20 @@ class ExecveParser:
             return None
 
         try:
-            args_pattern = r'a(\d+)="([^"]*)"'
-            args_matches = re.findall(args_pattern, line)
-
+            args_matches = self.args_pattern.findall(line)
+            
             if not args_matches:
                 return line
 
             args_dict = {int(index): value for index, value in args_matches}
-
             sorted_args = sorted(args_dict.items())
             combined_command = " ".join(arg[1] for arg in sorted_args)
 
-            cleaned_line = re.sub(r'a\d+="[^"]*"\s*', '', line).strip()
-            cleaned_line = re.sub(r'argc=\d+\s*', '', cleaned_line).strip()
+            # Clean up the original line
+            cleaned_line = line
+            for pattern in self.cleanup_patterns:
+                cleaned_line = pattern.sub('', cleaned_line)
+            cleaned_line = cleaned_line.strip()
 
             processed_line = f"{cleaned_line} cmd=\"{combined_command}\""
             return processed_line
@@ -485,13 +541,23 @@ class ExecveParser:
             return line
 
     def run(self):
+        """
+        Main processing loop using readline() to avoid buffering issues
+        CRITICAL: Do NOT use 'for line in sys.stdin' with rsyslog omprog
+        """
         try:
-            for line in sys.stdin:
+            while True:
+                line = sys.stdin.readline()
+                if not line:  # EOF
+                    break
+                    
                 line = line.strip()
                 if line:
                     processed_line = self.process_execve_line(line)
                     if processed_line is not None:
-                        print(processed_line, flush=True)
+                        print(processed_line)
+                        sys.stdout.flush()  # Critical for omprog communication
+                        
         except (KeyboardInterrupt, BrokenPipeError):
             pass
         except Exception:
@@ -513,32 +579,49 @@ sudo chmod +x /usr/local/bin/qradar_execve_parser.py
 If SELinux is enabled on your system, configure the necessary permissions:
 
 ```bash
-# Allow rsyslog to make network connections
-sudo setsebool -P rsyslog_can_network_connect on
+# Check SELinux status
+getenforce
+
+# If SELinux is enabled, proceed with the following:
 
 # Set proper context for the Python script
 sudo semanage fcontext -a -t bin_t "/usr/local/bin/qradar_execve_parser.py"
 sudo restorecon -v /usr/local/bin/qradar_execve_parser.py
 
-# Allow rsyslog to execute external programs
-sudo setsebool -P nis_enabled 1
+# IMPORTANT: rsyslog_can_network_connect boolean does NOT exist
+# Instead, ensure rsyslog can connect to syslog ports
+sudo semanage port -l | grep syslog
+# If your QRadar port is not in the syslog_port_t list, add it:
+# sudo semanage port -a -t syslogd_port_t -p tcp <QRADAR_PORT>
 
-# If additional permissions are needed, create a custom policy
+# Allow rsyslog to execute external programs (if needed)
 # Check for denials first
 sudo ausearch -c 'rsyslogd' --raw | audit2allow -M my-rsyslogd
-# Apply the policy if needed
+# Review the generated policy before applying
+sudo cat my-rsyslogd.te
+# Apply only if necessary
 sudo semodule -i my-rsyslogd.pp
+
+# Alternative: If you encounter issues, you can temporarily set permissive mode for rsyslog
+# sudo semanage permissive -a rsyslogd_t
+# Note: This is less secure and should only be used for troubleshooting
 ```
 
 ### 6. Configure FirewallD
 
-If FirewallD is enabled and you have strict outbound rules, allow traffic to QRadar:
+If FirewallD is enabled, configure it to allow outbound traffic to QRadar:
 
 ```bash
-# For most environments, outbound traffic is allowed by default
-# If you have strict outbound rules, add this:
-sudo firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -d <QRADAR_IP> -p tcp --dport <QRADAR_PORT> -j ACCEPT
+# Check if firewalld is running
+sudo systemctl status firewalld
+
+# Most environments allow outbound traffic by default
+# If you need to explicitly allow it:
+sudo firewall-cmd --permanent --add-port=<QRADAR_PORT>/tcp
 sudo firewall-cmd --reload
+
+# Verify the rule
+sudo firewall-cmd --list-all
 ```
 
 ### 7. Configure Rsyslog Forwarding
@@ -553,6 +636,7 @@ Copy and paste the following configuration into the file, replacing `<QRADAR_IP>
 
 ```
 # QRadar Log Forwarding Configuration
+# Load required modules
 module(load="omprog")
 
 # QRadar-compatible template (RFC 3339 time stamp)
@@ -562,26 +646,28 @@ template(name="QRadarFormat" type="string"
 # Only process messages from facility local3
 if $syslogfacility-text == 'local3' then {
 
-    # Process EXECVE events with parser to prevent duplicates
+    # Process EXECVE events with parser
     if $msg contains 'type=EXECVE' then {
         action(
             type="omprog"
             binary="/usr/local/bin/qradar_execve_parser.py"
             template="RSYSLOG_TraditionalFileFormat"
-            forceSingleInstance="on"
+            # Note: forceSingleInstance requires rsyslog v8.38.0+
+            # Uncomment if your version supports it:
+            # forceSingleInstance="on"
             queue.workerThreads="1"
         )
     }
     
-    # Forward all audit logs to QRadar
+    # Forward all audit logs to QRadar using TCP (recommended)
     action(
         type="omfwd"
         target="<QRADAR_IP>"
         port="<QRADAR_PORT>"
-        protocol="tcp"
+        protocol="tcp"  # Use TCP for reliable delivery
         template="QRadarFormat"
         
-        # Reliable async queue with reasonable limits
+        # Reliable async queue with production-ready settings
         queue.type="linkedlist"
         queue.size="50000"
         queue.maxdiskspace="2g"
@@ -590,7 +676,7 @@ if $syslogfacility-text == 'local3' then {
         queue.lowWatermark="10000"
         queue.discardMark="45000"
         queue.discardSeverity="4"
-        action.resumeRetryCount="100"
+        action.resumeRetryCount="-1"  # Infinite retries for reliability
         action.resumeInterval="30"
     )
 
@@ -612,6 +698,9 @@ sudo systemctl restart rsyslog
 Verify the configuration and test log forwarding:
 
 ```bash
+# Check rsyslog version
+rsyslogd -v
+
 # Check rsyslog configuration syntax
 sudo rsyslogd -N1
 
@@ -622,8 +711,11 @@ echo 'type=EXECVE msg=audit(123:456): argc=3 a0="ls" a1="-la" a2="/tmp"' | sudo 
 logger -p local3.info "Test QRadar forwarding"
 logger -p local3.info 'type=EXECVE msg=audit(1234:567): argc=3 a0="test" a1="-la" a2="/tmp"'
 
-# Monitor traffic to QRadar
+# Monitor traffic to QRadar (should show TCP connection)
 sudo tcpdump -i any host <QRADAR_IP> and port <QRADAR_PORT> -A -n
+
+# Check for SELinux denials
+sudo ausearch -m avc -ts recent
 ```
 
 ## Troubleshooting
@@ -638,6 +730,9 @@ sudo systemctl status rsyslog
 
 # View rsyslog errors
 sudo journalctl -u rsyslog -f
+
+# Check audit daemon logs
+sudo ausearch -m daemon_start -ts recent
 ```
 
 ### Debug Rsyslog Configuration
@@ -647,14 +742,35 @@ sudo rsyslogd -dn 2>&1 | grep -i "qradar\|omprog\|omfwd\|local3"
 
 # Check rsyslog statistics
 sudo pkill -USR1 rsyslogd && sudo tail -f /var/log/messages | grep rsyslogd-pstats
+
+# Verify rsyslog is receiving audit logs
+sudo tail -f /var/log/messages | grep local3
 ```
 
-### Common Issues
+### Common Issues and Solutions
 
-1. **SELinux Denials**: Check `/var/log/audit/audit.log` for denials and create custom policies as needed
-2. **Network Connectivity**: Ensure the system can reach QRadar on the specified port
-3. **Parser Errors**: Test the parser script manually with sample EXECVE logs
-4. **Queue Overflow**: Adjust queue sizes based on your log volume
+1. **SELinux Denials**: 
+   - Check `/var/log/audit/audit.log` for denials
+   - Use `audit2allow` to create custom policies only if needed
+   - Remember: `rsyslog_can_network_connect` boolean does NOT exist
+
+2. **Network Connectivity**: 
+   - Ensure TCP connectivity to QRadar: `telnet <QRADAR_IP> <QRADAR_PORT>`
+   - Check for firewall blocks: `sudo iptables -L -n | grep <QRADAR_PORT>`
+
+3. **Parser Errors**: 
+   - Test the parser script manually with sample EXECVE logs
+   - Ensure Python script uses `readline()` not `for line in sys.stdin`
+   - Check script has executable permissions
+
+4. **Queue Overflow**: 
+   - Monitor queue statistics in rsyslog stats
+   - Adjust queue sizes based on your log volume
+   - Consider disk-assisted queues for very high volumes
+
+5. **RHEL 8+ audispd Path**: 
+   - Remember the path change from `/etc/audisp/` to `/etc/audit/plugins.d/`
+   - Verify correct path exists before editing
 
 ## Performance Tuning
 
@@ -663,15 +779,30 @@ For high-volume environments, consider these optimizations:
 ### Audit Buffer Size
 ```bash
 # In /etc/audit/rules.d/99-qradar.rules, increase buffer size:
--b 32768  # or higher for very busy systems
+-b 32768  # or higher for very busy systems (max: 65536)
 ```
 
 ### Rsyslog Global Settings
 ```bash
 # Add to /etc/rsyslog.conf:
+global(
+    maxMessageSize="64k"
+    workDirectory="/var/spool/rsyslog"
+)
+
+# Or legacy format:
 $MaxMessageSize 64k
 $WorkDirectory /var/spool/rsyslog
-$ActionFileDefaultTemplate RSYSLOG_TraditionalFileFormat
+```
+
+### Disk-Assisted Queues for High Volume
+```bash
+# Modify the queue configuration in 99-qradar.conf:
+queue.type="linkedlist"
+queue.filename="qradar_queue"  # Enables disk assistance
+queue.maxdiskspace="5g"
+queue.highwatermark="500000"
+queue.lowwatermark="200000"
 ```
 
 ### Log Rotation
@@ -684,15 +815,48 @@ $ActionFileDefaultTemplate RSYSLOG_TraditionalFileFormat
     delaycompress
     notifempty
     create 0600 root root
+    sharedscripts
     postrotate
         /usr/bin/pkill -HUP rsyslogd > /dev/null 2>&1 || true
+        /sbin/service auditd restart > /dev/null 2>&1 || true
     endscript
 }
 ```
 
-## Notes
+## Network Protocol Recommendation
+
+**Always use TCP instead of UDP for QRadar log forwarding:**
+- TCP ensures reliable delivery with acknowledgments
+- UDP can result in log loss during network congestion
+- QRadar handles TCP connections efficiently
+- Use `protocol="tcp"` in the omfwd action
+
+## Version-Specific Notes
+
+### Rsyslog Versions
+- **v8.38.0+**: Supports `forceSingleInstance` parameter
+- **v8.30.0+**: Improved default queue sizes
+- **v7.x**: May require different module loading syntax
+
+### Distribution Differences
+- **RHEL 8+**: audispd integrated into auditd, different plugin path
+- **Rocky Linux**: Minimal install doesn't include rsyslog
+- **Ubuntu 20.04+**: Uses `/etc/audit/plugins.d/` path
+- **Debian 9**: Uses older `/etc/audisp/plugins.d/` path
+
+## Security Considerations
+
+1. **Use TCP with Encryption**: Consider TLS for sensitive environments
+2. **Limit Parser Permissions**: Run with minimal required privileges
+3. **Monitor Queue Sizes**: Prevent DoS through queue exhaustion
+4. **Regular Updates**: Keep rsyslog and audit packages updated
+5. **Access Control**: Restrict access to audit rules and configuration files
+
+## Final Notes
 
 - The Python parser script formats EXECVE logs for better readability in QRadar
 - All audit events are forwarded to QRadar, with EXECVE events being pre-processed
 - The configuration uses reliable queuing to prevent log loss during network issues
+- TCP protocol is strongly recommended over UDP for reliability
 - Adjust queue parameters based on your environment's log volume and network reliability
+- Test thoroughly in a non-production environment before deploying
